@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/light"
+	"github.com/ethereum/go-ethereum/p2p"
 )
 
 const (
@@ -71,14 +72,17 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 	if peer == nil {
 		return
 	}
-
 	// Make sure the peer's TD is higher than our own.
 	if !pm.needToSync(peer.headBlockInfo()) {
 		return
 	}
-
+	// Only sync with the peer if it's more or less in sync with the network
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-	pm.blockchain.(*light.LightChain).SyncCht(ctx)
+
+	if !pm.blockchain.(*light.LightChain).SyncCht(ctx) {
+		peer.Disconnect(p2p.DiscUselessPeer)
+		return
+	}
 	pm.downloader.Synchronise(peer.id, peer.Head(), peer.Td(), downloader.LightSync)
 }
