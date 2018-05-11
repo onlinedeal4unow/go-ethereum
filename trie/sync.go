@@ -19,6 +19,8 @@ package trie
 import (
 	"errors"
 	"fmt"
+	"math"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -76,6 +78,8 @@ type TrieSync struct {
 	membatch *syncMemBatch            // Memory buffer to avoid frequest database writes
 	requests map[common.Hash]*request // Pending requests pertaining to a key hash
 	queue    *prque.Prque             // Priority queue with the pending requests
+
+	priority uint64 // Identifier component for the priority queue to split between same depths
 }
 
 // NewTrieSync creates a new trie data download scheduler.
@@ -242,7 +246,7 @@ func (s *TrieSync) schedule(req *request) {
 		return
 	}
 	// Schedule the request for future retrieval
-	s.queue.Push(req.hash, float32(req.depth))
+	s.queue.Push(req.hash, float32(req.depth)*math.MaxUint64+float32(math.MaxUint64-atomic.AddUint64(&s.priority, 1)))
 	s.requests[req.hash] = req
 }
 
