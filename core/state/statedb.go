@@ -532,6 +532,9 @@ func (self *StateDB) GetRefund() uint64 {
 // Finalise finalises the state by removing the self destructed objects
 // and clears the journal as well as the refunds.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) {
+	// Finalize all deleted objects, gather all updated ones
+	pending := make([]*stateObject, 0, s.journal.length())
+
 	for addr := range s.journal.dirties {
 		stateObject, exist := s.stateObjects[addr]
 		if !exist {
@@ -543,15 +546,27 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 			// Thus, we can safely ignore it here
 			continue
 		}
-
+		// Deletions are handled inline
 		if stateObject.suicided || (deleteEmptyObjects && stateObject.empty()) {
 			s.deleteStateObject(stateObject)
-		} else {
+			s.stateObjectsDirty[addr] = struct{}{}
+			continue
+		}
+		// Plain accounts don't change, update inline
+		if stateObject.code == nil {
 			stateObject.updateRoot(s.db)
 			s.updateStateObject(stateObject)
+			s.stateObjectsDirty[addr] = struct{}{}
+			continue
 		}
-		s.stateObjectsDirty[addr] = struct{}{}
+		// Contracts might make sense to hash concurrenty, schedule
+		pending = append(pending, stateObject)
 	}
+	// Concurrently finalize all the updated storage tries
+	finalizer.finalize(s.db, pending, func(obj *stateObject) {
+		s.updateStateObject(obj)
+		s.stateObjectsDirty[obj.address] = struct{}{}
+	})
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
 }
