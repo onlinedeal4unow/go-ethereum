@@ -292,13 +292,13 @@ func (api *PrivateDebugAPI) traceChain(ctx context.Context, start, end *types.Bl
 				break
 			}
 			// Reference the trie twice, once for us, once for the trancer
-			database.TrieDB().Reference(root, common.Hash{})
+			database.TrieDB().Reference(common.Hash{}, root, common.Hash{})
 			if number >= origin {
-				database.TrieDB().Reference(root, common.Hash{})
+				database.TrieDB().Reference(common.Hash{}, root, common.Hash{})
 			}
 			// Dereference all past tries we ourselves are done working with
 			if proot != (common.Hash{}) {
-				database.TrieDB().Dereference(proot)
+				database.TrieDB().Dereference(proot, false)
 			}
 			proot = root
 
@@ -322,7 +322,7 @@ func (api *PrivateDebugAPI) traceChain(ctx context.Context, start, end *types.Bl
 			done[uint64(result.Block)] = result
 
 			// Dereference any paret tries held in memory by this task
-			database.TrieDB().Dereference(res.rootref)
+			database.TrieDB().Dereference(res.rootref, false)
 
 			// Stream completed traces to the user, aborting on the first error
 			for result, ok := done[next]; ok; result, ok = done[next] {
@@ -527,9 +527,9 @@ func (api *PrivateDebugAPI) computeStateDB(block *types.Block, reexec uint64) (*
 		if err := statedb.Reset(root); err != nil {
 			return nil, err
 		}
-		database.TrieDB().Reference(root, common.Hash{})
+		database.TrieDB().Reference(common.Hash{}, root, common.Hash{})
 		if proot != (common.Hash{}) {
-			database.TrieDB().Dereference(proot)
+			database.TrieDB().Dereference(proot, false)
 		}
 		proot = root
 	}
