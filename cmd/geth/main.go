@@ -207,22 +207,24 @@ func init() {
 		if err := debug.Setup(ctx, logdir); err != nil {
 			return err
 		}
-		// Cap the cache allowance and tune the garbage collector
-		var mem gosigar.Mem
-		if err := mem.Get(); err == nil {
-			allowance := int(mem.Total / 1024 / 1024 / 3)
-			if cache := ctx.GlobalInt(utils.CacheFlag.Name); cache > allowance {
-				log.Warn("Sanitizing cache to Go's GC limits", "provided", cache, "updated", allowance)
-				ctx.GlobalSet(utils.CacheFlag.Name, strconv.Itoa(allowance))
+		// Only enforce GC limits if we're not attaching to a remote node
+		if args := ctx.Args(); len(args) == 0 || args[0] != "attach" {
+			// Cap the cache allowance and tune the garbage collector
+			var mem gosigar.Mem
+			if err := mem.Get(); err == nil {
+				allowance := int(mem.Total / 1024 / 1024 / 3)
+				if cache := ctx.GlobalInt(utils.CacheFlag.Name); cache > allowance {
+					log.Warn("Sanitizing cache to Go's GC limits", "provided", cache, "updated", allowance)
+					ctx.GlobalSet(utils.CacheFlag.Name, strconv.Itoa(allowance))
+				}
 			}
+			// Ensure Go's GC ignores the database cache for trigger percentage
+			cache := ctx.GlobalInt(utils.CacheFlag.Name)
+			gogc := math.Max(20, math.Min(100, 100/(float64(cache)/1024)))
+
+			log.Debug("Sanitizing Go's GC trigger", "percent", int(gogc))
+			godebug.SetGCPercent(int(gogc))
 		}
-		// Ensure Go's GC ignores the database cache for trigger percentage
-		cache := ctx.GlobalInt(utils.CacheFlag.Name)
-		gogc := math.Max(20, math.Min(100, 100/(float64(cache)/1024)))
-
-		log.Debug("Sanitizing Go's GC trigger", "percent", int(gogc))
-		godebug.SetGCPercent(int(gogc))
-
 		// Start metrics export if enabled
 		utils.SetupMetrics(ctx)
 
