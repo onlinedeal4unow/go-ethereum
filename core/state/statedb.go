@@ -773,6 +773,7 @@ func (s *StateDB) GetRefund() uint64 {
 // the journal as well as the refunds. Finalise, however, will not push any updates
 // into the tries just yet. Only IntermediateRoot or Commit will do that.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) {
+	var addressesToPrefetch []common.Address
 	for addr := range s.journal.dirties {
 		obj, exist := s.stateObjects[addr]
 		if !exist {
@@ -805,9 +806,13 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		// will start loading tries, and when the change is eventually committed,
 		// the commit-phase will be a lot faster
 		if s.prefetcher != nil {
-			s.prefetcher.PrefetchAddress(addr)
+			addressesToPrefetch = append(addressesToPrefetch, addr)
 		}
 	}
+	if s.prefetcher != nil {
+		s.prefetcher.PrefetchAddresses(addressesToPrefetch)
+	}
+
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
 }
@@ -831,8 +836,8 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			if trie := s.prefetcher.GetTrie(s.originalRoot); trie != nil {
 				s.trie = trie
 			}
+			s.originalRoot = common.Hash{}
 		}
-		s.originalRoot = common.Hash{}
 	}
 	for addr := range s.stateObjectsPending {
 		obj := s.stateObjects[addr]

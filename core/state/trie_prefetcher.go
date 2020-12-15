@@ -67,7 +67,7 @@ type cmd struct {
 type fetchRequest struct {
 	slots       []common.Hash
 	storageRoot *common.Hash
-	address     *common.Address
+	addresses   []common.Address
 }
 
 func (p *TriePrefetcher) Loop() {
@@ -100,7 +100,7 @@ func (p *TriePrefetcher) Loop() {
 					if req.slots != nil {
 						skipped += int64(len(req.slots))
 					} else {
-						skipped++
+						skipped += int64(len(req.addresses))
 					}
 				default:
 					break drain
@@ -157,12 +157,13 @@ func (p *TriePrefetcher) Loop() {
 				}
 				for _, key := range req.slots {
 					storageTrie.TryGet(key[:])
-					fetched++
 				}
+				fetched += int64(len(req.slots))
 			} else { // an account
-				addr := *req.address
-				accountTrie.TryGet(addr[:])
-				fetched++
+				for _, addr := range req.addresses {
+					accountTrie.TryGet(addr[:])
+				}
+				fetched += int64(len(req.addresses))
 			}
 		}
 	}
@@ -201,17 +202,17 @@ func (p *TriePrefetcher) Pause() {
 	<-p.deliveryCh
 }
 
-// PrefetchAddress adds an address for prefetching
-func (p *TriePrefetcher) PrefetchAddress(addr common.Address) {
+// PrefetchAddresses adds an address for prefetching
+func (p *TriePrefetcher) PrefetchAddresses(addresses []common.Address) {
 	cmd := fetchRequest{
-		address: &addr,
+		addresses: addresses,
 	}
 	// We do an async send here, to not cause the caller to block
 	//p.requestCh <- cmd
 	select {
 	case p.requestCh <- cmd:
 	default:
-		triePrefetchDropMeter.Mark(1)
+		triePrefetchDropMeter.Mark(int64(len(addresses)))
 	}
 }
 
