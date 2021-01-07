@@ -252,8 +252,8 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	bc.prefetcher = newStatePrefetcher(chainConfig, bc, engine)
 	tp := state.NewTriePrefetcher(bc.stateCache)
 
+	bc.wg.Add(1)
 	go func() {
-		bc.wg.Add(1)
 		tp.Loop()
 		bc.wg.Done()
 	}()
