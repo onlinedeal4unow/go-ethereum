@@ -802,6 +802,7 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		}
 		s.stateObjectsPending[addr] = struct{}{}
 		s.stateObjectsDirty[addr] = struct{}{}
+
 		// At this point, also ship the address off to the precacher. The precacher
 		// will start loading tries, and when the change is eventually committed,
 		// the commit-phase will be a lot faster
@@ -809,10 +810,9 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 			addressesToPrefetch = append(addressesToPrefetch, addr)
 		}
 	}
-	if s.prefetcher != nil {
+	if s.prefetcher != nil && addressesToPrefetch != nil {
 		s.prefetcher.PrefetchAddresses(addressesToPrefetch)
 	}
-
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
 }
@@ -829,10 +829,10 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	// a trie which has the same root, but also has some content loaded into it.
 	// If so, use that one instead.
 	if s.prefetcher != nil {
-		s.prefetcher.Pause()
 		// We only want to do this _once_, if someone calls IntermediateRoot again,
 		// we shouldn't fetch the trie again
 		if s.originalRoot != (common.Hash{}) {
+			s.prefetcher.Pause()
 			if trie := s.prefetcher.GetTrie(s.originalRoot); trie != nil {
 				s.trie = trie
 			}
