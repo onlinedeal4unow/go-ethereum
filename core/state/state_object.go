@@ -315,7 +315,7 @@ func (s *stateObject) finalise() {
 		s.pendingStorage[key] = value
 		trieChanges = append(trieChanges, key)
 	}
-	if len(trieChanges) > 0 && s.db.prefetcher != nil && s.data.Root != emptyRoot {
+	if s.db.prefetcher != nil && len(trieChanges) > 0 && s.data.Root != emptyRoot && !s.deleted {
 		s.db.prefetcher.PrefetchStorage(s.data.Root, trieChanges)
 	}
 	if len(s.dirtyStorage) > 0 {
