@@ -31,8 +31,15 @@ var (
 	// needs to be investigated
 	trieDeliveryMissMeter = metrics.NewRegisteredMeter("trie/prefetch/deliverymiss", nil)
 
-	triePrefetchFetchMeter = metrics.NewRegisteredMeter("trie/prefetch/fetch", nil)
-	triePrefetchSkipMeter  = metrics.NewRegisteredMeter("trie/prefetch/skip", nil)
+	triePrefetchAccountLoadMeter  = metrics.NewRegisteredMeter("trie/prefetch/account/load", nil)
+	triePrefetchAccountDupMeter   = metrics.NewRegisteredMeter("trie/prefetch/account/dup", nil)
+	triePrefetchAccountSkipMeter  = metrics.NewRegisteredMeter("trie/prefetch/account/skip", nil)
+	triePrefetchAccountWasteMeter = metrics.NewRegisteredMeter("trie/prefetch/account/waste", nil)
+
+	triePrefetchStorageLoadMeter  = metrics.NewRegisteredMeter("trie/prefetch/storage/load", nil)
+	triePrefetchStorageDupMeter   = metrics.NewRegisteredMeter("trie/prefetch/storage/dup", nil)
+	triePrefetchStorageSkipMeter  = metrics.NewRegisteredMeter("trie/prefetch/storage/skip", nil)
+	triePrefetchStorageWasteMeter = metrics.NewRegisteredMeter("trie/prefetch/storage/waste", nil)
 )
 
 // TriePrefetcher is an active prefetcher, which receives accounts or storage
@@ -47,9 +54,11 @@ type TriePrefetcher struct {
 	reqCh  chan struct{} // Notification channel for new preload requests
 	quitCh chan struct{}
 
-	accountTasks []common.Address              // Set of accounts to prefetch
-	storageTasks map[common.Hash][]common.Hash // Set of storage slots to prefetch
-	taskLock     sync.Mutex                    // Lock protecting the task sets
+	accountTasks     []common.Address                         // Set of accounts to prefetch
+	storageTasks     map[common.Hash][]common.Hash            // Set of storage slots to prefetch
+	accountTasksDone map[common.Address]struct{}              // Set of accounts prefetched
+	storageTasksDone map[common.Hash]map[common.Hash]struct{} // Set of storage slots prefetched
+	taskLock         sync.Mutex                               // Lock protecting the task sets
 
 	paused uint32 // Whether the prefetcher is actively loading data or serving tries
 
@@ -81,9 +90,10 @@ func (p *TriePrefetcher) Loop() {
 		storageTries    map[common.Hash]Trie
 
 		err error
+
 		// Some tracking of performance
-		skipped int64
-		fetched int64
+		accountLoads, accountDups, accountSkips, accountWastes int64
+		storageLoads, storageDups, storageSkips, storageWastes int64
 
 		paused = true
 	)
@@ -103,12 +113,25 @@ func (p *TriePrefetcher) Loop() {
 			}
 
 			if paused {
-				// Prefetcher is being resumed, clear old data
+				// Prefetcher is being resumed, mark any old data as waste
+				p.taskLock.Lock()
+				accountWastes += int64(len(p.accountTasksDone))
+				for storageTasksDone := range p.storageTasksDone {
+					storageWastes += int64(len(storageTasksDone))
+				}
+				p.accountTasksDone = make(map[common.Address]struct{})
+				p.storageTasksDone = make(map[common.Hash]map[common.Hash]struct{})
+				p.taskLock.Unlock()
+
+				triePrefetchAccountWasteMeter.Mark(accountWastes)
+				triePrefetchStorageWasteMeter.Mark(storageWastes)
+				accountWastes, storageWastes = 0, 0
+
+				// Start with a new set of tries
 				p.storageTries = nil
 				p.accountTrie = nil
 				p.accountTrieRoot = common.Hash{}
 
-				// Start with a new set of tries
 				storageTries = make(map[common.Hash]Trie)
 				accountTrieRoot = cmd.root
 				accountTrie, err = p.db.OpenTrie(accountTrieRoot)
@@ -120,20 +143,26 @@ func (p *TriePrefetcher) Loop() {
 				}
 				paused = false
 			} else {
-				// Prefetcher is being paused, abort all unfulfilled requests
+				// Prefetcher is being paused, update all metrics
 				p.taskLock.Lock()
-				skipped += int64(len(p.accountTasks))
+				accountSkips += int64(len(p.accountTasks))
 				for storageTasks := range p.storageTasks {
-					skipped += int64(len(storageTasks))
+					storageSkips += int64(len(storageTasks))
 				}
 				p.accountTasks = nil
 				p.storageTasks = make(map[common.Hash][]common.Hash)
 				p.taskLock.Unlock()
 
-				// Update metrics at new block events
-				triePrefetchFetchMeter.Mark(fetched)
-				triePrefetchSkipMeter.Mark(skipped)
-				fetched, skipped = 0, 0
+				triePrefetchAccountLoadMeter.Mark(accountLoads)
+				triePrefetchAccountDupMeter.Mark(accountDups)
+				triePrefetchAccountSkipMeter.Mark(accountSkips)
+
+				triePrefetchStorageLoadMeter.Mark(storageLoads)
+				triePrefetchStorageDupMeter.Mark(storageDups)
+				triePrefetchStorageSkipMeter.Mark(storageSkips)
+
+				accountLoads, accountDups, accountSkips = 0, 0, 0
+				storageLoads, storageDups, storageSkips = 0, 0, 0
 
 				// Make the tries accessible
 				p.accountTrie = accountTrie
@@ -168,9 +197,17 @@ func (p *TriePrefetcher) Loop() {
 				if atomic.LoadUint32(&p.paused) == 1 {
 					break
 				}
-				accountTrie.TryGet(addr[:])
-				fetched++
+				if _, ok := p.accountTasksDone[addr]; ok {
+					accountDups++
+				} else {
+					accountTrie.TryGet(addr[:])
+					p.accountTasksDone[addr] = struct{}{}
+					accountLoads++
+				}
+				accountTasks = accountTasks[1:]
 			}
+
+			// All accounts prefetched, digress into the storage tasks
 			for root, slots := range storageTasks {
 				if atomic.LoadUint32(&p.paused) == 1 {
 					break
@@ -179,26 +216,43 @@ func (p *TriePrefetcher) Loop() {
 					storageTrie, err := p.db.OpenTrie(root)
 					if err != nil {
 						log.Warn("Trie prefetcher failed opening storage trie", "root", root, "err", err)
-						skipped += int64(len(slots))
+						storageSkips += int64(len(slots))
 						continue
+					}
+					if _, ok := p.storageTasksDone[root]; !ok {
+						p.storageTasksDone[root] = make(map[common.Hash]struct{})
 					}
 					storageTries[root] = storageTrie
 				}
+				slotTasksDone := p.storageTasksDone[root]
 				storageTrie := storageTries[root]
 				for _, hash := range slots {
 					if atomic.LoadUint32(&p.paused) == 1 {
 						break
 					}
-					storageTrie.TryGet(hash[:])
+					if _, ok := slotTasksDone[hash]; ok {
+						storageDups++
+					} else {
+						storageTrie.TryGet(hash[:])
+						slotTasksDone[hash] = struct{}{}
+						storageLoads++
+					}
+					slots = slots[1:]
 				}
-				fetched += int64(len(slots))
+				if len(slots) == 0 {
+					delete(storageTasks, root)
+				} else {
+					storageTasks[root] = slots
+				}
 			}
-			// If pre-fetching was interrupted, mark all remaining asks as skipped
+			// If pre-fetching was interrupted, return all remaining tasks into the queue
 			if atomic.LoadUint32(&p.paused) == 1 {
-				skipped += int64(len(accountTasks))
-				for tasks := range storageTasks {
-					skipped += int64(len(tasks))
+				p.taskLock.Lock()
+				p.accountTasks = append(p.accountTasks, accountTasks...)
+				for root, slots := range storageTasks {
+					p.storageTasks[root] = append(p.storageTasks[root], slots...)
 				}
+				p.taskLock.Unlock()
 			}
 		}
 	}
@@ -249,7 +303,7 @@ func (p *TriePrefetcher) Pause() {
 }
 
 // PrefetchAddresses adds an address for prefetching
-func (p *TriePrefetcher) PrefetchAddresses(addresses []common.Address) {
+func (p *TriePrefetcher) PrefetchAddresses(addrs []common.Address) {
 	// Abort if the prefetcher is already paused
 	if atomic.LoadUint32(&p.paused) == 1 {
 		log.Error("Attempted account trie-prefetch whilst paused")
@@ -259,7 +313,7 @@ func (p *TriePrefetcher) PrefetchAddresses(addresses []common.Address) {
 	p.taskLock.Lock()
 	defer p.taskLock.Unlock()
 
-	p.accountTasks = append(p.accountTasks, addresses...)
+	p.accountTasks = append(p.accountTasks, addrs...)
 	select {
 	case p.reqCh <- struct{}{}:
 	default:
@@ -288,15 +342,12 @@ func (p *TriePrefetcher) PrefetchStorage(root common.Hash, slots []common.Hash) 
 
 // GetTrie returns the trie matching the root hash, or nil if the prefetcher
 // doesn't have it.
-//
-// Note, if snapshots are not enabled, we'll hit this code path during normal
-// transaction processing, so don't check for that invariant.
 func (p *TriePrefetcher) GetTrie(root common.Hash) Trie {
 	// Abort if the prefetcher is not paused
-	//if atomic.LoadUint32(&p.paused) == 0 {
-	//	log.Error("Attempted trie-prefetcher retrieval whilst not paused")
-	//	return nil
-	//}
+	if atomic.LoadUint32(&p.paused) == 0 {
+		log.Error("Attempted trie-prefetcher retrieval whilst not paused")
+		return nil
+	}
 	if root == p.accountTrieRoot {
 		return p.accountTrie
 	}
@@ -309,4 +360,42 @@ func (p *TriePrefetcher) GetTrie(root common.Hash) Trie {
 	}
 	trieDeliveryMissMeter.Mark(1)
 	return nil
+}
+
+// UseAddresses marks a batch of addresses used to allow creating statistics as to
+// how useful or wasteful the prefetcher is.
+func (p *TriePrefetcher) UseAddresses(addrs []common.Address) {
+	// Abort if the prefetcher is not paused
+	if atomic.LoadUint32(&p.paused) == 0 {
+		log.Error("Attempted account usage marking whilst not paused")
+		return
+	}
+	// Drop the used addresses from the finished task sets
+	p.taskLock.Lock()
+	defer p.taskLock.Unlock()
+
+	for _, addr := range addrs {
+		delete(p.accountTasksDone, addr)
+	}
+}
+
+// UseStorage marks a batch of storage slots used to allow creating statistics
+// as to how useful or wasteful the prefetcher is.
+func (p *TriePrefetcher) UseStorage(root common.Hash, slots []common.Hash) {
+	// Abort if the prefetcher is not paused
+	if atomic.LoadUint32(&p.paused) == 0 {
+		log.Error("Attempted account usage marking whilst not paused")
+		return
+	}
+	// Drop the used storage slots from the finished task sets
+	p.taskLock.Lock()
+	defer p.taskLock.Unlock()
+
+	slotTasksDone := p.storageTasksDone[root]
+	for _, hash := range slots {
+		delete(slotTasksDone, hash)
+	}
+	if len(slotTasksDone) == 0 {
+		delete(p.storageTasksDone, root)
+	}
 }

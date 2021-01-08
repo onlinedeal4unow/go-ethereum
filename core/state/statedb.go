@@ -773,7 +773,7 @@ func (s *StateDB) GetRefund() uint64 {
 // the journal as well as the refunds. Finalise, however, will not push any updates
 // into the tries just yet. Only IntermediateRoot or Commit will do that.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) {
-	var addressesToPrefetch []common.Address
+	addressesToPrefetch := make([]common.Address, 0, len(s.journal.dirties))
 	for addr := range s.journal.dirties {
 		obj, exist := s.stateObjects[addr]
 		if !exist {
@@ -798,7 +798,7 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 				delete(s.snapStorage, obj.addrHash)        // Clear out any previously updated storage data (may be recreated via a ressurrect)
 			}
 		} else {
-			obj.finalise()
+			obj.finalise(true) // Prefetch slots in the background
 		}
 		s.stateObjectsPending[addr] = struct{}{}
 		s.stateObjectsDirty[addr] = struct{}{}
@@ -806,11 +806,9 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		// At this point, also ship the address off to the precacher. The precacher
 		// will start loading tries, and when the change is eventually committed,
 		// the commit-phase will be a lot faster
-		if s.prefetcher != nil {
-			addressesToPrefetch = append(addressesToPrefetch, addr)
-		}
+		addressesToPrefetch = append(addressesToPrefetch, addr)
 	}
-	if s.prefetcher != nil && addressesToPrefetch != nil {
+	if s.prefetcher != nil && len(addressesToPrefetch) > 0 {
 		s.prefetcher.PrefetchAddresses(addressesToPrefetch)
 	}
 	// Invalidate journal because reverting across transactions is not allowed.
@@ -839,6 +837,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.originalRoot = common.Hash{}
 		}
 	}
+	usedAddresses := make([]common.Address, 0, len(s.stateObjectsPending))
 	for addr := range s.stateObjectsPending {
 		obj := s.stateObjects[addr]
 		if obj.deleted {
@@ -847,6 +846,10 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			obj.updateRoot(s.db)
 			s.updateStateObject(obj)
 		}
+		usedAddresses = append(usedAddresses, addr)
+	}
+	if s.prefetcher != nil {
+		s.prefetcher.UseAddresses(usedAddresses)
 	}
 	if len(s.stateObjectsPending) > 0 {
 		s.stateObjectsPending = make(map[common.Address]struct{})

@@ -1870,7 +1870,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 			parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
 		}
 		statedb, err := state.New(parent.Root, bc.stateCache, bc.snaps)
-		statedb.UsePrefetcher(bc.triePrefetcher)
+		if bc.snaps != nil {
+			statedb.UsePrefetcher(bc.triePrefetcher)
+		}
 		if err != nil {
 			return it.index, err
 		}
