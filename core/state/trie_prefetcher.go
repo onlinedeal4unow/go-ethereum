@@ -184,12 +184,7 @@ func (p *TriePrefetcher) Loop() {
 			// Retrieve all the tasks queued up and reset the sets for new insertions
 			p.taskLock.Lock()
 			accountTasks, storageTasks := p.accountTasks, p.storageTasks
-			if len(accountTasks) > 0 {
-				p.accountTasks = nil
-			}
-			if len(storageTasks) > 0 {
-				p.storageTasks = make(map[common.Hash][]common.Hash)
-			}
+			p.accountTasks, p.storageTasks = nil, make(map[common.Hash][]common.Hash)
 			p.taskLock.Unlock()
 
 			// Keep prefetching the data until an interruption is triggered
