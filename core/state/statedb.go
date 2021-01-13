@@ -63,7 +63,7 @@ func (n *proofList) Delete(key []byte) error {
 // * Accounts
 type StateDB struct {
 	db           Database
-	prefetcher   *TriePrefetcher
+	prefetcher   *triePrefetcher
 	originalRoot common.Hash // The pre-state root, before any changes were made
 	trie         Trie
 	hasher       crypto.KeccakState
@@ -144,16 +144,15 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 			sdb.snapDestructs = make(map[common.Hash]struct{})
 			sdb.snapAccounts = make(map[common.Hash][]byte)
 			sdb.snapStorage = make(map[common.Hash]map[common.Hash][]byte)
+			sdb.prefetcher = newTriePrefetcher(db, root)
 		}
 	}
 	return sdb, nil
 }
 
-func (s *StateDB) UsePrefetcher(prefetcher *TriePrefetcher) {
-	if prefetcher != nil {
-		s.prefetcher = prefetcher
-		s.prefetcher.Resume(s.originalRoot)
-	}
+// TODO(karalabe): Hack until we figure out if we need the old prefetcher or not
+func (s *StateDB) NoPrefetcher() {
+	s.prefetcher = nil
 }
 
 // setError remembers the first non-nil error it is called with.
@@ -773,7 +772,7 @@ func (s *StateDB) GetRefund() uint64 {
 // the journal as well as the refunds. Finalise, however, will not push any updates
 // into the tries just yet. Only IntermediateRoot or Commit will do that.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) {
-	addressesToPrefetch := make([]common.Address, 0, len(s.journal.dirties))
+	addressesToPrefetch := make([][]byte, 0, len(s.journal.dirties))
 	for addr := range s.journal.dirties {
 		obj, exist := s.stateObjects[addr]
 		if !exist {
@@ -806,10 +805,10 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		// At this point, also ship the address off to the precacher. The precacher
 		// will start loading tries, and when the change is eventually committed,
 		// the commit-phase will be a lot faster
-		addressesToPrefetch = append(addressesToPrefetch, addr)
+		addressesToPrefetch = append(addressesToPrefetch, common.CopyBytes(addr[:])) // Copy needed for closure
 	}
 	if s.prefetcher != nil && len(addressesToPrefetch) > 0 {
-		s.prefetcher.PrefetchAddresses(addressesToPrefetch)
+		s.prefetcher.prefetch(s.originalRoot, addressesToPrefetch)
 	}
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
@@ -822,22 +821,28 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	// Finalise all the dirty storage states and write them into the tries
 	s.Finalise(deleteEmptyObjects)
 
-	// Now we're about to start to write changes to the trie. The trie is so
-	// far _untouched_. We can check with the prefetcher, if it can give us
-	// a trie which has the same root, but also has some content loaded into it.
-	// If so, use that one instead.
+	// If there was a trie prefetcher operating, it gets aborted and irrevocably
+	// modified after we start retrieving tries. Remove it from the statedb after
+	// this round of use.
+	//
+	// This is weird pre-byzantium since the first tx runs with a prefetcher and
+	// the remainder without, but pre-byzantium even the initial prefetcher is
+	// useless, so no sleep lost.
+	prefetcher := s.prefetcher
 	if s.prefetcher != nil {
-		// We only want to do this _once_, if someone calls IntermediateRoot again,
-		// we shouldn't fetch the trie again
-		if s.originalRoot != (common.Hash{}) {
-			s.prefetcher.Pause()
-			if trie := s.prefetcher.GetTrie(s.originalRoot); trie != nil {
-				s.trie = trie
-			}
-			s.originalRoot = common.Hash{}
+		defer func() {
+			s.prefetcher.report()
+			s.prefetcher = nil
+		}()
+	}
+	// Now we're about to start to write changes to the trie. The trie is so far
+	// _untouched_. We can check with the prefetcher, if it can give us a trie
+	// which has the same root, but also has some content loaded into it.
+	if prefetcher != nil {
+		if trie := prefetcher.trie(s.originalRoot); trie != nil {
+			s.trie = trie
 		}
 	}
-	usedAddresses := make([]common.Address, 0, len(s.stateObjectsPending))
 	for addr := range s.stateObjectsPending {
 		obj := s.stateObjects[addr]
 		if obj.deleted {
@@ -846,10 +851,9 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			obj.updateRoot(s.db)
 			s.updateStateObject(obj)
 		}
-		usedAddresses = append(usedAddresses, addr)
 	}
-	if s.prefetcher != nil {
-		s.prefetcher.UseAddresses(usedAddresses)
+	if prefetcher != nil {
+		prefetcher.used(s.originalRoot, len(s.stateObjectsPending))
 	}
 	if len(s.stateObjectsPending) > 0 {
 		s.stateObjectsPending = make(map[common.Address]struct{})

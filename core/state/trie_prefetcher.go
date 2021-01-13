@@ -18,7 +18,6 @@ package state
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
@@ -42,355 +41,201 @@ var (
 	triePrefetchStorageWasteMeter = metrics.NewRegisteredMeter("trie/prefetch/storage/waste", nil)
 )
 
-// TriePrefetcher is an active prefetcher, which receives accounts or storage
+// triePrefetcher is an active prefetcher, which receives accounts or storage
 // items and does trie-loading of them. The goal is to get as much useful content
 // into the caches as possible.
 //
 // Note, the prefetcher's API is not thread safe.
-type TriePrefetcher struct {
-	db Database
-
-	cmdCh  chan *command // Control channel to pause or reset the root
-	reqCh  chan struct{} // Notification channel for new preload requests
-	quitCh chan struct{}
-
-	accountTasks     []common.Address                         // Set of accounts to prefetch
-	storageTasks     map[common.Hash][]common.Hash            // Set of storage slots to prefetch
-	accountTasksDone map[common.Address]struct{}              // Set of accounts prefetched
-	storageTasksDone map[common.Hash]map[common.Hash]struct{} // Set of storage slots prefetched
-	taskLock         sync.Mutex                               // Lock protecting the task sets
-
-	paused uint32 // Whether the prefetcher is actively loading data or serving tries
-
-	storageTries    map[common.Hash]Trie
-	accountTrie     Trie
-	accountTrieRoot common.Hash
+type triePrefetcher struct {
+	db       Database                    // Database to fetch trie nodes through
+	root     common.Hash                 // Root hash of theaccount trie for metrics
+	fetchers map[common.Hash]*subfetcher // Subfetchers for each trie
 }
 
-func NewTriePrefetcher(db Database) *TriePrefetcher {
-	return &TriePrefetcher{
-		db:           db,
-		cmdCh:        make(chan *command),
-		reqCh:        make(chan struct{}, 1), // 1 to notify, no need to track multiple notifications
-		quitCh:       make(chan struct{}),
-		storageTasks: make(map[common.Hash][]common.Hash),
-		paused:       1, // User needs to call Resume() before allowing to preload data
+func newTriePrefetcher(db Database, root common.Hash) *triePrefetcher {
+	return &triePrefetcher{
+		db:       db,
+		root:     root,
+		fetchers: make(map[common.Hash]*subfetcher),
 	}
 }
 
-type command struct {
-	root common.Hash
-	done chan struct{}
-}
+// report iterates over all the subfetchers, aborts any that were left spinning
+// and reports the stats to the metrics subsystem.
+func (p *triePrefetcher) report() {
+	for _, fetcher := range p.fetchers {
+		fetcher.abort() // safe to do multiple times
 
-func (p *TriePrefetcher) Loop() {
-	var (
-		accountTrieRoot common.Hash
-		accountTrie     Trie
-		storageTries    map[common.Hash]Trie
-
-		err error
-
-		// Some tracking of performance
-		accountLoads, accountDups, accountSkips, accountWastes int64
-		storageLoads, storageDups, storageSkips, storageWastes int64
-
-		paused = true
-	)
-	// The prefetcher loop has two distinct phases:
-	// 1: Paused: when in this state, the accumulated tries are accessible to outside
-	// callers.
-	// 2: Active prefetching, awaiting slots and accounts to prefetch
-	for {
-		select {
-		case <-p.quitCh:
-			return
-		case cmd := <-p.cmdCh:
-			// Clear out any pending update notification
-			select {
-			case <-p.reqCh: // Skip stale notification
-			default: // No notification queued
-			}
-
-			if paused {
-				// Prefetcher is being resumed, mark any old data as waste
-				p.taskLock.Lock()
-				accountWastes += int64(len(p.accountTasksDone))
-				for storageTasksDone := range p.storageTasksDone {
-					storageWastes += int64(len(storageTasksDone))
-				}
-				p.accountTasksDone = make(map[common.Address]struct{})
-				p.storageTasksDone = make(map[common.Hash]map[common.Hash]struct{})
-				p.taskLock.Unlock()
-
-				triePrefetchAccountWasteMeter.Mark(accountWastes)
-				triePrefetchStorageWasteMeter.Mark(storageWastes)
-				accountWastes, storageWastes = 0, 0
-
-				// Start with a new set of tries
-				p.storageTries = nil
-				p.accountTrie = nil
-				p.accountTrieRoot = common.Hash{}
-
-				storageTries = make(map[common.Hash]Trie)
-				accountTrieRoot = cmd.root
-				accountTrie, err = p.db.OpenTrie(accountTrieRoot)
-				if err != nil {
-					log.Error("Trie prefetcher failed opening trie", "root", accountTrieRoot, "err", err)
-				}
-				if accountTrieRoot == (common.Hash{}) {
-					log.Error("Trie prefetcher unpaused with bad root")
-				}
-				paused = false
-			} else {
-				// Prefetcher is being paused, update all metrics
-				p.taskLock.Lock()
-				accountSkips += int64(len(p.accountTasks))
-				for storageTasks := range p.storageTasks {
-					storageSkips += int64(len(storageTasks))
-				}
-				p.accountTasks = nil
-				p.storageTasks = make(map[common.Hash][]common.Hash)
-				p.taskLock.Unlock()
-
-				triePrefetchAccountLoadMeter.Mark(accountLoads)
-				triePrefetchAccountDupMeter.Mark(accountDups)
-				triePrefetchAccountSkipMeter.Mark(accountSkips)
-
-				triePrefetchStorageLoadMeter.Mark(storageLoads)
-				triePrefetchStorageDupMeter.Mark(storageDups)
-				triePrefetchStorageSkipMeter.Mark(storageSkips)
-
-				accountLoads, accountDups, accountSkips = 0, 0, 0
-				storageLoads, storageDups, storageSkips = 0, 0, 0
-
-				// Make the tries accessible
-				p.accountTrie = accountTrie
-				p.storageTries = storageTries
-				p.accountTrieRoot = accountTrieRoot
-
-				if cmd.root != (common.Hash{}) {
-					log.Error("Trie prefetcher paused with non-empty root")
-				}
-				paused = true
-			}
-			close(cmd.done)
-
-		case <-p.reqCh:
-			if paused {
-				log.Error("Prefetch request arrived whilst paused")
-				continue
-			}
-			// Retrieve all the tasks queued up and reset the sets for new insertions
-			p.taskLock.Lock()
-			accountTasks, storageTasks := p.accountTasks, p.storageTasks
-			p.accountTasks, p.storageTasks = nil, make(map[common.Hash][]common.Hash)
-			p.taskLock.Unlock()
-
-			// Keep prefetching the data until an interruption is triggered
-			for _, addr := range accountTasks {
-				if atomic.LoadUint32(&p.paused) == 1 {
-					break
-				}
-				if _, ok := p.accountTasksDone[addr]; ok {
-					accountDups++
-				} else {
-					accountTrie.TryGet(addr[:])
-					p.accountTasksDone[addr] = struct{}{}
-					accountLoads++
-				}
-				accountTasks = accountTasks[1:]
-			}
-
-			// All accounts prefetched, digress into the storage tasks
-			for root, slots := range storageTasks {
-				if atomic.LoadUint32(&p.paused) == 1 {
-					break
-				}
-				if _, ok := storageTries[root]; !ok {
-					storageTrie, err := p.db.OpenTrie(root)
-					if err != nil {
-						log.Warn("Trie prefetcher failed opening storage trie", "root", root, "err", err)
-						storageSkips += int64(len(slots))
-						continue
-					}
-					if _, ok := p.storageTasksDone[root]; !ok {
-						p.storageTasksDone[root] = make(map[common.Hash]struct{})
-					}
-					storageTries[root] = storageTrie
-				}
-				slotTasksDone := p.storageTasksDone[root]
-				storageTrie := storageTries[root]
-				for _, hash := range slots {
-					if atomic.LoadUint32(&p.paused) == 1 {
-						break
-					}
-					if _, ok := slotTasksDone[hash]; ok {
-						storageDups++
-					} else {
-						storageTrie.TryGet(hash[:])
-						slotTasksDone[hash] = struct{}{}
-						storageLoads++
-					}
-					slots = slots[1:]
-				}
-				if len(slots) == 0 {
-					delete(storageTasks, root)
-				} else {
-					storageTasks[root] = slots
-				}
-			}
-			// If pre-fetching was interrupted, return all remaining tasks into the queue
-			if atomic.LoadUint32(&p.paused) == 1 {
-				p.taskLock.Lock()
-				p.accountTasks = append(p.accountTasks, accountTasks...)
-				for root, slots := range storageTasks {
-					p.storageTasks[root] = append(p.storageTasks[root], slots...)
-				}
-				p.taskLock.Unlock()
-			}
+		if fetcher.root == p.root {
+			triePrefetchAccountLoadMeter.Mark(int64(len(fetcher.seen)))
+			triePrefetchAccountDupMeter.Mark(int64(fetcher.dups))
+			triePrefetchAccountSkipMeter.Mark(int64(len(fetcher.tasks)))
+			triePrefetchAccountWasteMeter.Mark(int64(len(fetcher.seen) - fetcher.used))
+		} else {
+			triePrefetchStorageLoadMeter.Mark(int64(len(fetcher.seen)))
+			triePrefetchStorageDupMeter.Mark(int64(fetcher.dups))
+			triePrefetchStorageSkipMeter.Mark(int64(len(fetcher.tasks)))
+			triePrefetchStorageWasteMeter.Mark(int64(len(fetcher.seen) - fetcher.used))
 		}
 	}
+	// Clear out all fetchers (will crash on a second call, deliberate)
+	p.fetchers = nil
 }
 
-// Close stops the prefetcher
-func (p *TriePrefetcher) Close() {
-	if p.quitCh != nil {
-		close(p.quitCh)
-		p.quitCh = nil
+// prefetch schedules a batch of trie items to prefetch.
+func (p *triePrefetcher) prefetch(root common.Hash, keys [][]byte) {
+	fetcher := p.fetchers[root]
+	if fetcher == nil {
+		fetcher = newSubfetcher(p.db, root)
+		p.fetchers[root] = fetcher
 	}
+	fetcher.schedule(keys)
 }
 
-// Resume causes the prefetcher to clear out old data, and get ready to
-// fetch data concerning the new root.
-func (p *TriePrefetcher) Resume(root common.Hash) {
-	// Abort if the prefetcher is not paused
-	if atomic.LoadUint32(&p.paused) == 0 {
-		log.Error("Trie prefetcher already resumed")
-		return
-	}
-	atomic.StoreUint32(&p.paused, 0)
-
-	cmd := &command{
-		root: root,
-		done: make(chan struct{}),
-	}
-	p.cmdCh <- cmd
-	<-cmd.done
-}
-
-// Pause causes the prefetcher to pause prefetching, and make tries
-// accessible to callers via GetTrie.
-func (p *TriePrefetcher) Pause() {
-	// Abort if the prefetcher is already paused
-	if atomic.LoadUint32(&p.paused) == 1 {
-		log.Error("Trie prefetcher already paused")
-		return
-	}
-	atomic.StoreUint32(&p.paused, 1)
-
-	// Request a pause and wait until it's done
-	cmd := &command{
-		done: make(chan struct{}),
-	}
-	p.cmdCh <- cmd
-	<-cmd.done
-}
-
-// PrefetchAddresses adds an address for prefetching
-func (p *TriePrefetcher) PrefetchAddresses(addrs []common.Address) {
-	// Abort if the prefetcher is already paused
-	if atomic.LoadUint32(&p.paused) == 1 {
-		log.Error("Attempted account trie-prefetch whilst paused")
-		return
-	}
-	// Inject the addresses into the task queue and notify the prefetcher
-	p.taskLock.Lock()
-	defer p.taskLock.Unlock()
-
-	p.accountTasks = append(p.accountTasks, addrs...)
-	select {
-	case p.reqCh <- struct{}{}:
-	default:
-		// Already notified
-	}
-}
-
-// PrefetchStorage adds a storage root and a set of keys for prefetching
-func (p *TriePrefetcher) PrefetchStorage(root common.Hash, slots []common.Hash) {
-	// Abort if the prefetcher is already paused
-	if atomic.LoadUint32(&p.paused) == 1 {
-		log.Error("Attempted storage trie-prefetch whilst paused")
-		return
-	}
-	// Inject the storage hashes into the task queue and notify the prefetcher
-	p.taskLock.Lock()
-	defer p.taskLock.Unlock()
-
-	p.storageTasks[root] = append(p.storageTasks[root], slots...)
-	select {
-	case p.reqCh <- struct{}{}:
-	default:
-		// Already notified
-	}
-}
-
-// GetTrie returns the trie matching the root hash, or nil if the prefetcher
-// doesn't have it.
-func (p *TriePrefetcher) GetTrie(root common.Hash) Trie {
-	// Abort if the prefetcher is not paused
-	if atomic.LoadUint32(&p.paused) == 0 {
-		log.Error("Attempted trie-prefetcher retrieval whilst not paused")
+// trie returns the trie matching the root hash, or nil if the prefetcher doesn't
+// have it.
+func (p *triePrefetcher) trie(root common.Hash) Trie {
+	// Bail out if no trie was prefetched for this root
+	fetcher := p.fetchers[root]
+	if fetcher == nil {
+		trieDeliveryMissMeter.Mark(1)
 		return nil
 	}
-	if root == p.accountTrieRoot {
-		return p.accountTrie
+	// Interrupt the prefetcher if it's by any chance still running and return
+	// a copy of any pre-loaded trie.
+	fetcher.abort() // safe to do multiple times
+
+	if fetcher.trie == nil {
+		trieDeliveryMissMeter.Mark(1)
+		return nil
 	}
-	if storageTrie, ok := p.storageTries[root]; ok {
-		// Two accounts may well have the same storage root, but we cannot allow
-		// them both to make updates to the same trie instance. Therefore,
-		// we need to either delete the trie now, or deliver a copy of the trie.
-		delete(p.storageTries, root)
-		return storageTrie
-	}
-	trieDeliveryMissMeter.Mark(1)
-	return nil
+	// Two accounts may well have the same storage root, but we cannot allow
+	// them both to make updates to the same trie instance. Therefore, we need
+	// to either delete the trie now, or deliver a copy of the trie.
+	original := fetcher.trie
+	fetcher.trie = nil
+
+	return original
 }
 
-// UseAddresses marks a batch of addresses used to allow creating statistics as to
+// used marks a batch of state items used to allow creating statistics as to
 // how useful or wasteful the prefetcher is.
-func (p *TriePrefetcher) UseAddresses(addrs []common.Address) {
-	// Abort if the prefetcher is not paused
-	if atomic.LoadUint32(&p.paused) == 0 {
-		log.Error("Attempted account usage marking whilst not paused")
-		return
-	}
-	// Drop the used addresses from the finished task sets
-	p.taskLock.Lock()
-	defer p.taskLock.Unlock()
-
-	for _, addr := range addrs {
-		delete(p.accountTasksDone, addr)
+func (p *triePrefetcher) used(root common.Hash, used int) {
+	if fetcher := p.fetchers[root]; fetcher != nil {
+		fetcher.used = used
 	}
 }
 
-// UseStorage marks a batch of storage slots used to allow creating statistics
-// as to how useful or wasteful the prefetcher is.
-func (p *TriePrefetcher) UseStorage(root common.Hash, slots []common.Hash) {
-	// Abort if the prefetcher is not paused
-	if atomic.LoadUint32(&p.paused) == 0 {
-		log.Error("Attempted account usage marking whilst not paused")
+// subfetcher is a trie fetcher goroutine responsible for pulling entries for a
+// single trie. It is spawned when a new root is encountered and lives until the
+// main prefetcher is paused and either all requested items are processed or if
+// the trie being worked on is retrieved from the prefetcher.
+type subfetcher struct {
+	db   Database    // Database to load trie nodes through
+	root common.Hash // Root hash of the trie to prefetch
+	trie Trie        // Trie being populated with nodes
+
+	tasks [][]byte   // Items queued up for retrieval
+	lock  sync.Mutex // Lock protecting the task queue
+
+	wake chan struct{} // Wake channel if a new task is scheduled
+	stop chan struct{} // Channel to interrupt processing
+	term chan struct{} // Channel to signal iterruption
+
+	seen map[string]struct{} // Tracks the entries already loaded
+	dups int                 // Number of duplicate preload tasks
+	used int                 // Tracks the entries used in the end
+}
+
+// newSubfetcher creates a goroutine to prefetch state items belonging to a
+// particular root hash.
+func newSubfetcher(db Database, root common.Hash) *subfetcher {
+	sf := &subfetcher{
+		db:   db,
+		root: root,
+		wake: make(chan struct{}, 1),
+		stop: make(chan struct{}),
+		term: make(chan struct{}),
+		seen: make(map[string]struct{}),
+	}
+	go sf.loop()
+	return sf
+}
+
+// schedule adds a batch of trie keys to the queue to prefetch.
+func (sf *subfetcher) schedule(keys [][]byte) {
+	// Append the tasks to the current queue
+	sf.lock.Lock()
+	sf.tasks = append(sf.tasks, keys...)
+	sf.lock.Unlock()
+
+	// Notify the prefetcher, it's fine if it's already terminated
+	select {
+	case sf.wake <- struct{}{}:
+	default:
+	}
+}
+
+// abort interrupts the subfetcher immediately. It is safe to call abort multiple
+// times but it is not thread safe.
+func (sf *subfetcher) abort() {
+	select {
+	case <-sf.stop:
+	default:
+		close(sf.stop)
+	}
+	<-sf.term
+}
+
+// loop waits for new tasks to be scheduled and keeps loading them until it runs
+// out of tasks or its underlying trie is retrieved for committing.
+func (sf *subfetcher) loop() {
+	// No matter how the loop stops, signal anyone waiting that it's terminated
+	defer close(sf.term)
+
+	// Start by opening the trie and stop processing if it fails
+	trie, err := sf.db.OpenTrie(sf.root)
+	if err != nil {
+		log.Warn("Trie prefetcher failed opening trie", "root", sf.root, "err", err)
 		return
 	}
-	// Drop the used storage slots from the finished task sets
-	p.taskLock.Lock()
-	defer p.taskLock.Unlock()
+	sf.trie = trie
 
-	slotTasksDone := p.storageTasksDone[root]
-	for _, hash := range slots {
-		delete(slotTasksDone, hash)
-	}
-	if len(slotTasksDone) == 0 {
-		delete(p.storageTasksDone, root)
+	// Trie opened successfully, keep prefetching items
+	for {
+		select {
+		case <-sf.wake:
+			// Subfetcher was woken up, retrieve any tasks to avoid spinning the lock
+			sf.lock.Lock()
+			tasks := sf.tasks
+			sf.tasks = nil
+			sf.lock.Unlock()
+
+			// Prefetch any tasks until the loop is interrupted
+			for i, task := range tasks {
+				select {
+				case <-sf.stop:
+					// If termination is requested, add any leftover back and return
+					sf.lock.Lock()
+					sf.tasks = append(sf.tasks, tasks[i:]...)
+					sf.lock.Unlock()
+					return
+
+				default:
+					// No termination request yet, prefetch the next entry
+					taskid := string(task)
+					if _, ok := sf.seen[taskid]; ok {
+						sf.dups++
+					} else {
+						sf.trie.TryGet(task)
+						sf.seen[taskid] = struct{}{}
+					}
+				}
+			}
+
+		case <-sf.stop:
+			// Termination is requested, abort and leave remaining tasks
+			return
+		}
 	}
 }
