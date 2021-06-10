@@ -845,7 +845,11 @@ func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash 
 	defer cancel()
 
 	// Get a new instance of the EVM.
-	msg, err := args.ToMessage(globalGasCap, header.BaseFee)
+	var baseFee *big.Int
+	if b.ChainConfig().IsLondon(new(big.Int).Add(header.Number, big.NewInt(1))) {
+		baseFee = misc.CalcBaseFee(b.ChainConfig(), header)
+	}
+	msg, err := args.ToMessage(globalGasCap, baseFee)
 	if err != nil {
 		return nil, err
 	}
