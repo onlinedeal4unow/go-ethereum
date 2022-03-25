@@ -497,6 +497,9 @@ func (t *Trie) CommitTo(db DatabaseWriter) (root common.Hash, err error) {
 	}
 	t.root = cached
 	t.cachegen++
+
+	glog.V(logger.Debug).Infof("Trie cache stats: %d misses, %d unloads", CacheMisses(), CacheUnloads())
+
 	return common.BytesToHash(hash.(hashNode)), nil
 }
 
